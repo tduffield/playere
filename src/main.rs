@@ -4,8 +4,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use wry::{
     application::{
+        accelerator::{Accelerator, SysMods},
         event::{Event, StartCause, WindowEvent},
         event_loop::{ControlFlow, EventLoop},
+        keyboard::KeyCode,
+        menu::{MenuBar, MenuId, MenuItem, MenuItemAttributes},
         window::{Window, WindowBuilder},
     },
     webview::WebViewBuilder,
@@ -74,6 +77,35 @@ fn cursor_is_over_window(_window: &Window) -> bool {
     true
 }
 
+/// The clipboard's text, if it holds any.
+#[cfg(target_os = "macos")]
+fn clipboard_text() -> Option<String> {
+    use cocoa::base::nil;
+    use cocoa::foundation::NSString;
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pasteboard.is_null() {
+            return None;
+        }
+        let kind = NSString::alloc(nil).init_str("public.utf8-plain-text");
+        let value: *mut Object = msg_send![pasteboard, stringForType: kind];
+        if value.is_null() {
+            return None;
+        }
+        let bytes: *const std::os::raw::c_char = msg_send![value, UTF8String];
+        let text = std::ffi::CStr::from_ptr(bytes).to_string_lossy().into_owned();
+        Some(text).filter(|t| !t.trim().is_empty())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clipboard_text() -> Option<String> {
+    None
+}
+
 /// Where the last-played URL is remembered between launches.
 fn state_file() -> Option<PathBuf> {
     let home = env::var_os("HOME")?;
@@ -118,7 +150,71 @@ fn main() -> wry::Result<()> {
     };
 
     let event_loop = EventLoop::new();
+    // The shortcuts live in a real menu rather than in page JavaScript: the
+    // YouTube iframe is cross-origin, so once it has focus it swallows every
+    // keystroke and the page never sees them. Menu accelerators are handled by
+    // the system before the webview, and they are discoverable besides.
+    let menu_play_clipboard = MenuId::new("play_clipboard");
+    let menu_enter_url = MenuId::new("enter_url");
+    let menu_toggle_pin = MenuId::new("toggle_pin");
+    let menu_open_browser = MenuId::new("open_browser");
+
+    let mut app_menu = MenuBar::new();
+    app_menu.add_native_item(MenuItem::Hide);
+    app_menu.add_native_item(MenuItem::HideOthers);
+    app_menu.add_native_item(MenuItem::Separator);
+    app_menu.add_native_item(MenuItem::Quit);
+
+    let mut video_menu = MenuBar::new();
+    video_menu.add_item(
+        MenuItemAttributes::new("Play URL from Clipboard")
+            .with_id(menu_play_clipboard)
+            .with_accelerators(&Accelerator::new(SysMods::Cmd, KeyCode::KeyL)),
+    );
+    video_menu.add_item(
+        MenuItemAttributes::new("Enter URL…")
+            .with_id(menu_enter_url)
+            .with_accelerators(&Accelerator::new(SysMods::Cmd, KeyCode::KeyN)),
+    );
+    video_menu.add_native_item(MenuItem::Separator);
+    video_menu.add_item(
+        MenuItemAttributes::new("Always on Top")
+            .with_id(menu_toggle_pin)
+            .with_accelerators(&Accelerator::new(SysMods::Cmd, KeyCode::KeyT)),
+    );
+    video_menu.add_item(
+        MenuItemAttributes::new("Open in Browser")
+            .with_id(menu_open_browser)
+            .with_accelerators(&Accelerator::new(SysMods::Cmd, KeyCode::KeyB)),
+    );
+    video_menu.add_native_item(MenuItem::Separator);
+    video_menu.add_native_item(MenuItem::CloseWindow);
+
+    // Without these the webview gets no clipboard or selection shortcuts at all,
+    // so the URL field could not be pasted into.
+    let mut edit_menu = MenuBar::new();
+    edit_menu.add_native_item(MenuItem::Undo);
+    edit_menu.add_native_item(MenuItem::Redo);
+    edit_menu.add_native_item(MenuItem::Separator);
+    edit_menu.add_native_item(MenuItem::Cut);
+    edit_menu.add_native_item(MenuItem::Copy);
+    edit_menu.add_native_item(MenuItem::Paste);
+    edit_menu.add_native_item(MenuItem::SelectAll);
+
+    let mut window_menu = MenuBar::new();
+    window_menu.add_native_item(MenuItem::Minimize);
+    window_menu.add_native_item(MenuItem::Zoom);
+    window_menu.add_native_item(MenuItem::Separator);
+    window_menu.add_native_item(MenuItem::EnterFullScreen);
+
+    let mut menu = MenuBar::new();
+    menu.add_submenu("YouTube Player", true, app_menu);
+    menu.add_submenu("Video", true, video_menu);
+    menu.add_submenu("Edit", true, edit_menu);
+    menu.add_submenu("Window", true, window_menu);
+
     let builder = WindowBuilder::new()
+        .with_menu(menu)
         .with_title("YouTube Player")
         .with_always_on_top(false)
         .with_resizable(true)
@@ -316,41 +412,6 @@ fn main() -> wry::Result<()> {
             pointer-events: none;
         }}
         
-        .iframe-overlay {{
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            z-index: 10;
-            pointer-events: none;
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }}
-        
-        .iframe-overlay.show {{
-            opacity: 1;
-        }}
-        
-        .more-videos-hint {{
-            position: absolute;
-            bottom: 80px;
-            right: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 11px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            pointer-events: auto;
-            cursor: pointer;
-        }}
-        
-        .more-videos-hint:hover {{
-            background: rgba(0, 0, 0, 0.9);
-        }}
-        
         @media (max-width: 480px) {{
             .url-input-container {{
                 min-width: 320px;
@@ -373,12 +434,6 @@ fn main() -> wry::Result<()> {
                     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"
                     referrerpolicy="strict-origin-when-cross-origin">
             </iframe>
-            
-            <div id="iframe-overlay" class="iframe-overlay">
-                <div class="more-videos-hint" onclick="showNavigationHelp()" title="Help with video navigation">
-                    Right-click videos → Copy link → ⌘L
-                </div>
-            </div>
             
             <div id="url-input-container" class="url-input-container">
                 <h1>YouTube Player</h1>
@@ -408,16 +463,11 @@ fn main() -> wry::Result<()> {
     
     <script>
         const state = {{
-            pinned: false,
             currentVideoId: null,
             currentPlaylistId: null,
             watchingVideo: false,
             isPlaylist: false
         }};
-        
-        function showNavigationHelp() {{
-            showToast('Right-click a video → Copy link, then ⌘L to paste it', 5000);
-        }}
         
         const elements = {{
             urlInput: document.getElementById('url-input'),
@@ -425,8 +475,7 @@ fn main() -> wry::Result<()> {
             videoPlayer: document.getElementById('video-player'),
             pasteBtn: document.getElementById('paste-btn'),
             loadBtn: document.getElementById('load-btn'),
-            pinToast: document.getElementById('pin-toast'),
-            iframeOverlay: document.getElementById('iframe-overlay')
+            pinToast: document.getElementById('pin-toast')
         }};
         
         function extractVideoId(url) {{
@@ -590,9 +639,6 @@ fn main() -> wry::Result<()> {
                 state.watchingVideo = true;
                 state.isPlaylist = urlData.isPlaylist;
                 
-                // Show navigation overlay
-                elements.iframeOverlay.classList.add('show');
-                
                 // Start monitoring for navigation
                 lastVideoId = state.currentVideoId;
                 startNavigationMonitoring();
@@ -633,16 +679,6 @@ fn main() -> wry::Result<()> {
             }}, duration);
         }}
         
-        // No native control exists for always-on-top, so ⌘T drives it and the
-        // toast is the only feedback that the state changed.
-        function togglePin() {{
-            state.pinned = !state.pinned;
-            showToast(state.pinned ? 'Always on top: on' : 'Always on top: off');
-            
-            if (window.ipc) {{
-                window.ipc.postMessage(`pin:${{state.pinned}}`);
-            }}
-        }}
         
         async function pasteFromClipboard() {{
             elements.pasteBtn.classList.add('loading');
@@ -729,9 +765,6 @@ fn main() -> wry::Result<()> {
             elements.urlInput.select();
             state.watchingVideo = false;
             
-            // Hide navigation overlay
-            elements.iframeOverlay.classList.remove('show');
-            
             // Stop monitoring when not watching
             stopNavigationMonitoring();
         }}
@@ -748,8 +781,8 @@ fn main() -> wry::Result<()> {
                 url = `https://www.youtube.com/watch?v=${{state.currentVideoId}}`;
             }}
             
-            if (url) {{
-                window.open(url, '_blank');
+            if (url && window.ipc) {{
+                window.ipc.postMessage(`browser:${{url}}`);
             }}
         }}
         
@@ -761,41 +794,12 @@ fn main() -> wry::Result<()> {
             }}
         }});
         
+        // Only non-modifier keys are handled here. Everything reached with the
+        // command key is a menu accelerator, because a focused YouTube iframe
+        // never forwards keystrokes to this document.
         document.addEventListener('keydown', (e) => {{
             if (e.key === 'Escape') {{
                 closeApp();
-            }}
-            
-            if ((e.metaKey || e.ctrlKey) && e.key === 'v') {{
-                if (!elements.urlContainer.classList.contains('hidden')) {{
-                    return; // Let browser handle paste
-                }}
-                
-                showUrlInput();
-                e.preventDefault();
-                pasteFromClipboard();
-            }}
-            
-            if ((e.metaKey || e.ctrlKey) && e.key === 'n') {{
-                e.preventDefault();
-                showUrlInput();
-            }}
-            
-            // The native titlebar carries no app controls, so these keys are the
-            // only way to reach what the custom bar used to expose.
-            if ((e.metaKey || e.ctrlKey) && e.key === 'l') {{
-                e.preventDefault();
-                showUrlInput();
-            }}
-            
-            if ((e.metaKey || e.ctrlKey) && e.key === 't') {{
-                e.preventDefault();
-                togglePin();
-            }}
-            
-            if ((e.metaKey || e.ctrlKey) && e.key === 'b') {{
-                e.preventDefault();
-                openInBrowser();
             }}
         }});
         
@@ -917,14 +921,16 @@ fn main() -> wry::Result<()> {
 
     let webview = WebViewBuilder::new(window)?
         .with_html(html)?
-        .with_ipc_handler(move |window, message| {
+        .with_ipc_handler(move |_window, message| {
             match message.as_str() {
                 "close" => {
                     std::process::exit(0);
                 }
-                msg if msg.starts_with("pin:") => {
-                    let pinned = msg.split(':').nth(1).unwrap_or("true") == "true";
-                    window.set_always_on_top(pinned);
+                msg if msg.starts_with("browser:") => {
+                    let url = &msg["browser:".len()..];
+                    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+                        eprintln!("Could not open browser: {}", e);
+                    }
                 }
                 msg if msg.starts_with("save:") => {
                     write_last_url(&msg["save:".len()..]);
@@ -946,6 +952,7 @@ fn main() -> wry::Result<()> {
     // the event loop busy.
     const HOVER_POLL: Duration = Duration::from_millis(150);
     let mut buttons_visible = false;
+    let mut pinned = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + HOVER_POLL);
@@ -958,6 +965,38 @@ fn main() -> wry::Result<()> {
                 if hovered != buttons_visible {
                     buttons_visible = hovered;
                     set_titlebar_buttons_alpha(window, if hovered { 1.0 } else { 0.0 });
+                }
+            }
+            Event::MenuEvent { menu_id, .. } => {
+                let window = webview.window();
+                if menu_id == menu_play_clipboard {
+                    match clipboard_text() {
+                        // loadVideoFromUrl already validates and reports a bad URL.
+                        Some(url) => {
+                            let script =
+                                format!("loadVideoFromUrl({})", serde_json::json!(url.trim()));
+                            let _ = webview.evaluate_script(&script);
+                        }
+                        None => {
+                            let _ = webview.evaluate_script(
+                                "showToast('Clipboard is empty — copy a YouTube link first')",
+                            );
+                        }
+                    }
+                } else if menu_id == menu_enter_url {
+                    let _ = webview.evaluate_script("showUrlInput()");
+                } else if menu_id == menu_toggle_pin {
+                    pinned = !pinned;
+                    window.set_always_on_top(pinned);
+                    let message = if pinned {
+                        "Always on top: on"
+                    } else {
+                        "Always on top: off"
+                    };
+                    let _ = webview
+                        .evaluate_script(&format!("showToast({})", serde_json::json!(message)));
+                } else if menu_id == menu_open_browser {
+                    let _ = webview.evaluate_script("openInBrowser()");
                 }
             }
             Event::WindowEvent {

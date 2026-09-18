@@ -9,11 +9,11 @@ A lightweight, distraction-free YouTube player built with Rust and Tauri. Watch 
 - **Resumes Where You Left Off**: Reopens the last video you loaded
 - **Always on Top**: Optional, off by default (`⌘T`)
 - **URL Auto-conversion**: Automatically converts YouTube URLs to embedded format
-- **Keyboard Shortcuts**: 
-  - `⌘L` to enter a different video (`⌘N` does the same)
+- **Keyboard Shortcuts** (all also in the **Video** menu):
+  - `⌘L` to play the YouTube URL currently on the clipboard
+  - `⌘N` to open the URL entry screen
   - `⌘T` to toggle always on top
   - `⌘B` to open the current video in your browser
-  - `⌘V` to paste a URL straight from the clipboard
   - `ESC` to close the player
   - `Enter` to load video from URL input
 - **Cross-platform**: Works on macOS, Linux, and Windows
@@ -96,13 +96,17 @@ cargo run --release
 
 1. **Launch**: Double-click the app icon or run from terminal
 2. **Load Video**: 
-   - Paste a YouTube URL in the input field
-   - Press Enter or click "Load Video"
+   - Copy a YouTube link anywhere, then press `⌘L` to play it straight away
+   - Or press `⌘N`, paste into the field, and press Enter
 3. **Move Window**: Drag the titlebar, as with any macOS window
 4. **Close**: Click the red window button (fades in on hover) or press ESC
 
 The window buttons are hidden while the pointer is outside the window. Move the
 mouse over the player to bring them back.
+
+The shortcuts are real menu accelerators rather than page JavaScript. They have
+to be: the embedded player is a cross-origin iframe, so once it has focus it
+receives every keystroke and the page behind it sees none of them.
 
 ### Supported URL Formats
 

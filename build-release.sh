@@ -30,9 +30,13 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # Copy binary
     cp target/release/playere "$APP_DIR/Contents/MacOS/YouTube Player"
     
-    # Copy icon if it exists
-    if [ -f "icons/icon.png" ]; then
-        cp icons/icon.png "$APP_DIR/Contents/Resources/icon.png"
+    # Copy icon. Assets.car pairs with CFBundleIconName below; without it macOS 26
+    # draws the .icns inside its own white plate. Both are named AppIcon.
+    if [ -f "icons/AppIcon.icns" ]; then
+        cp icons/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
+        [ -f "icons/Assets.car" ] && cp icons/Assets.car "$APP_DIR/Contents/Resources/Assets.car"
+    else
+        echo "⚠️  icons/AppIcon.icns missing — run ./icons/generate-icon.sh"
     fi
     
     # Create Info.plist
@@ -54,7 +58,9 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleIconFile</key>
-    <string>icon</string>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.13</string>
     <key>NSHighResolutionCapable</key>
@@ -63,6 +69,9 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 </plist>
 EOF
     
+    # Refresh the icon cache so Finder picks up the new icon immediately
+    touch "$APP_DIR"
+
     echo "📦 App bundle created at: $APP_DIR"
     echo "  - Binary: target/release/playere"
     

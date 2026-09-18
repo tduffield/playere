@@ -156,7 +156,10 @@ playere/
 ├── dist/
 │   └── index.html       # Frontend HTML/CSS/JS
 ├── icons/
-│   └── icon.png         # App icon
+│   ├── generate-icon.sh # Redraws the icon and its macOS containers
+│   ├── icon.png         # Master artwork (1024x1024)
+│   ├── AppIcon.icns     # Icon container the .app bundle ships
+│   └── Assets.car       # Compiled catalog; pairs with CFBundleIconName
 ├── tauri.conf.json      # Tauri configuration
 ├── Cargo.toml           # Rust dependencies
 └── build.rs             # Build script
@@ -177,6 +180,20 @@ You can customize the player by modifying:
 2. **Always on Top**: Toggle `alwaysOnTop` in `tauri.conf.json`
 3. **Styling**: Modify CSS in `dist/index.html`
 4. **Embed Parameters**: Edit the URL parameters in `src/main.rs`
+5. **App Icon**: Edit the shapes in `icons/generate-icon.sh`, re-run it, then
+   rebuild with `./build-release.sh`
+
+### App Icon
+
+`icons/generate-icon.sh` draws the artwork with ImageMagick and compiles the two
+containers the bundle ships. Both are committed, so a normal build needs neither
+ImageMagick nor Xcode — only regenerating the icon does.
+
+macOS 26 draws an app that carries only a classic `.icns` inside its own white
+rounded plate, which leaves the icon looking nested inside a second squircle.
+`Assets.car` plus the `CFBundleIconName` key in the bundle's `Info.plist` opts
+into the modern path, where the artwork is drawn edge to edge. Keep the two
+together — dropping either one brings the plate back.
 
 ## Troubleshooting
 

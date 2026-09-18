@@ -1,30 +1,142 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use wry::{
     application::{
         event::{Event, StartCause, WindowEvent},
         event_loop::{ControlFlow, EventLoop},
-        window::WindowBuilder,
+        window::{Window, WindowBuilder},
     },
     webview::WebViewBuilder,
 };
+
+#[cfg(target_os = "macos")]
+use wry::application::platform::macos::WindowBuilderExtMacOS;
+
+/// Fades the close/minimise/zoom buttons in and out. macOS has no built-in
+/// auto-hiding titlebar outside fullscreen, so the webview reports hover over
+/// IPC and we drive the buttons' alpha from here.
+#[cfg(target_os = "macos")]
+fn set_titlebar_buttons_alpha(window: &Window, alpha: f64) {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    use wry::application::platform::macos::WindowExtMacOS;
+
+    let ns_window = window.ns_window() as *mut Object;
+    if ns_window.is_null() {
+        return;
+    }
+    // NSWindowCloseButton = 0, NSWindowMiniaturizeButton = 1, NSWindowZoomButton = 2
+    for index in 0u64..3 {
+        unsafe {
+            let button: *mut Object = msg_send![ns_window, standardWindowButton: index];
+            if !button.is_null() {
+                let _: () = msg_send![button, setAlphaValue: alpha];
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_titlebar_buttons_alpha(_window: &Window, _alpha: f64) {}
+
+/// True while the pointer is within the window's frame. Polled rather than
+/// driven from the webview: the YouTube iframe swallows mouse events, so the
+/// page sees the cursor leave whenever it moves over the video.
+#[cfg(target_os = "macos")]
+fn cursor_is_over_window(window: &Window) -> bool {
+    use cocoa::appkit::NSEvent;
+    use cocoa::base::nil;
+    use cocoa::foundation::NSRect;
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    use wry::application::platform::macos::WindowExtMacOS;
+
+    let ns_window = window.ns_window() as *mut Object;
+    if ns_window.is_null() {
+        return false;
+    }
+    unsafe {
+        // Both are screen coordinates with a bottom-left origin, so they compare
+        // directly without converting between coordinate spaces.
+        let frame: NSRect = msg_send![ns_window, frame];
+        let cursor = NSEvent::mouseLocation(nil);
+        cursor.x >= frame.origin.x
+            && cursor.x <= frame.origin.x + frame.size.width
+            && cursor.y >= frame.origin.y
+            && cursor.y <= frame.origin.y + frame.size.height
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cursor_is_over_window(_window: &Window) -> bool {
+    true
+}
+
+/// Where the last-played URL is remembered between launches.
+fn state_file() -> Option<PathBuf> {
+    let home = env::var_os("HOME")?;
+    let dir = if cfg!(target_os = "macos") {
+        PathBuf::from(home).join("Library/Application Support/YouTube Player")
+    } else {
+        PathBuf::from(home).join(".config/youtube-player")
+    };
+    Some(dir.join("state.json"))
+}
+
+fn read_last_url() -> Option<String> {
+    let raw = fs::read_to_string(state_file()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("last_url")?
+        .as_str()
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+fn write_last_url(url: &str) {
+    let Some(path) = state_file() else { return };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = fs::create_dir_all(dir) {
+            eprintln!("Could not create state directory: {}", e);
+            return;
+        }
+    }
+    let body = serde_json::json!({ "last_url": url }).to_string();
+    if let Err(e) = fs::write(&path, body) {
+        eprintln!("Could not save last video: {}", e);
+    }
+}
 
 fn main() -> wry::Result<()> {
     let args: Vec<String> = env::args().collect();
     let initial_url = if args.len() > 1 {
         args[1].clone()
     } else {
-        String::new()
+        read_last_url().unwrap_or_default()
     };
 
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
+    let builder = WindowBuilder::new()
         .with_title("YouTube Player")
-        .with_decorations(false)
-        .with_always_on_top(true)
+        .with_always_on_top(false)
         .with_resizable(true)
         .with_inner_size(wry::application::dpi::LogicalSize::new(960, 540))
-        .with_min_inner_size(wry::application::dpi::LogicalSize::new(480, 270))
-        .build(&event_loop)?;
+        .with_min_inner_size(wry::application::dpi::LogicalSize::new(480, 270));
+
+    // A titled window is what gives macOS its rounded corners; the transparent
+    // titlebar over a full-size content view keeps the video edge to edge.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .with_titlebar_transparent(true)
+        .with_fullsize_content_view(true)
+        .with_title_hidden(true);
+
+    let window = builder.build(&event_loop)?;
+
+    // Start hidden; the buttons fade in when the cursor enters the window.
+    set_titlebar_buttons_alpha(&window, 0.0);
 
     let html = format!(r#"
 <!DOCTYPE html>
@@ -56,143 +168,28 @@ fn main() -> wry::Result<()> {
             flex-direction: column;
         }}
         
-        .titlebar {{
-            height: 32px;
-            background: rgba(0, 0, 0, 0.8);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 12px;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            cursor: default;
+        /* Nothing paints under the native titlebar, but keep clear of the
+           traffic lights when they fade in. */
+        .pin-toast {{
             position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            z-index: 1000;
-            opacity: 0;
-            transform: translateY(-100%);
-            transition: all 0.3s ease;
-        }}
-        
-        .app-container:hover .titlebar,
-        .titlebar:hover,
-        .titlebar.show {{
-            opacity: 1;
-            transform: translateY(0);
-        }}
-        
-        .titlebar.draggable {{
-            background: rgba(59, 130, 246, 0.2);
-            cursor: move;
-        }}
-        
-        .titlebar .title {{
-            font-size: 13px;
-            font-weight: 500;
-            color: rgba(255, 255, 255, 0.8);
-            min-width: 100px;
-        }}
-        
-        .titlebar-paste {{
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            flex: 1;
-            max-width: 300px;
-            -webkit-app-region: no-drag;
-        }}
-        
-        .titlebar-input {{
-            flex: 1;
-            background: rgba(255, 255, 255, 0.1);
+            top: 44px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
             border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
+            border-radius: 6px;
             color: rgba(255, 255, 255, 0.9);
             font-size: 12px;
-            padding: 4px 8px;
-            height: 22px;
-            outline: none;
-            transition: all 0.2s ease;
-            font-family: inherit;
+            padding: 6px 12px;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease;
         }}
         
-        .titlebar-input:focus {{
-            background: rgba(255, 255, 255, 0.15);
-            border-color: rgba(255, 255, 255, 0.3);
-            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
-        }}
-        
-        .titlebar-input::placeholder {{
-            color: rgba(255, 255, 255, 0.4);
-            font-size: 11px;
-        }}
-        
-        .paste-quick-btn {{
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
-            color: rgba(255, 255, 255, 0.6);
-            cursor: pointer;
-            font-size: 10px;
-            padding: 4px 6px;
-            height: 22px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s ease;
-            min-width: 22px;
-        }}
-        
-        .paste-quick-btn:hover {{
-            background: rgba(255, 255, 255, 0.15);
-            border-color: rgba(255, 255, 255, 0.2);
-            color: rgba(255, 255, 255, 0.9);
-        }}
-        
-        .controls {{
-            display: flex;
-            gap: 8px;
-            -webkit-app-region: no-drag;
-        }}
-        
-        .control-btn {{
-            width: 24px;
-            height: 24px;
-            border-radius: 4px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            background: rgba(255, 255, 255, 0.05);
-            color: rgba(255, 255, 255, 0.6);
-            cursor: pointer;
-            font-size: 11px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s ease;
-            backdrop-filter: blur(10px);
-        }}
-        
-        .control-btn:hover {{
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.2);
-            color: rgba(255, 255, 255, 0.9);
-        }}
-        
-        .control-btn.active {{
-            background: rgba(255, 255, 255, 0.15);
-            color: #ffffff;
-            border-color: rgba(255, 255, 255, 0.3);
-        }}
-        
-        .control-btn.close {{
-            color: rgba(255, 100, 100, 0.8);
-        }}
-        
-        .control-btn.close:hover {{
-            background: rgba(255, 59, 48, 0.2);
-            border-color: rgba(255, 59, 48, 0.3);
-            color: #ff3b30;
+        .pin-toast.show {{
+            opacity: 1;
         }}
         
         .main-content {{
@@ -368,36 +365,8 @@ fn main() -> wry::Result<()> {
 </head>
 <body>
     <div class="app-container">
-        <div class="titlebar" id="titlebar">
-            <div class="title">YouTube Player</div>
-            <div class="titlebar-paste">
-                <input type="text" 
-                       id="titlebar-input" 
-                       class="titlebar-input" 
-                       placeholder="Paste URL..."
-                       title="Type or paste YouTube URL here and press Enter"
-                       autocomplete="off"
-                       spellcheck="false">
-                <button class="paste-quick-btn" id="paste-quick-btn" onclick="pasteQuick()" title="Paste URL from clipboard">
-                    📋
-                </button>
-            </div>
-            <div class="controls">
-                <button class="control-btn" id="move-btn" onclick="toggleMove()" title="Move Mode">
-                    <span id="move-icon">⊹</span>
-                </button>
-                <button class="control-btn active" id="pin-btn" onclick="togglePin()" title="Always on Top">
-                    <span id="pin-icon">•</span>
-                </button>
-                <button class="control-btn" id="browser-btn" onclick="openInBrowser()" title="Open in Browser" style="display: none;">
-                    <span id="browser-icon">↗</span>
-                </button>
-                <button class="control-btn close" onclick="closeApp()" title="Close">
-                    ×
-                </button>
-            </div>
-        </div>
-        
+        <div class="pin-toast" id="pin-toast"></div>
+
         <div class="main-content">
             <iframe id="video-player" class="video-player hidden" 
                     allowfullscreen 
@@ -407,7 +376,7 @@ fn main() -> wry::Result<()> {
             
             <div id="iframe-overlay" class="iframe-overlay">
                 <div class="more-videos-hint" onclick="showNavigationHelp()" title="Help with video navigation">
-                    Right-click videos → Copy link → Paste here
+                    Right-click videos → Copy link → ⌘L
                 </div>
             </div>
             
@@ -439,8 +408,7 @@ fn main() -> wry::Result<()> {
     
     <script>
         const state = {{
-            dragEnabled: false,
-            pinned: true,
+            pinned: false,
             currentVideoId: null,
             currentPlaylistId: null,
             watchingVideo: false,
@@ -448,32 +416,16 @@ fn main() -> wry::Result<()> {
         }};
         
         function showNavigationHelp() {{
-            // Focus on titlebar input to encourage paste
-            elements.titlebarInput.focus();
-            elements.titlebarInput.placeholder = 'Right-click video → Copy link → Paste here';
-            
-            // Show titlebar if hidden
-            showTitlebar();
-            
-            // Reset placeholder after a while
-            setTimeout(() => {{
-                elements.titlebarInput.placeholder = 'Paste URL...';
-            }}, 5000);
+            showToast('Right-click a video → Copy link, then ⌘L to paste it', 5000);
         }}
         
         const elements = {{
-            titlebar: document.getElementById('titlebar'),
-            moveBtn: document.getElementById('move-btn'),
-            moveIcon: document.getElementById('move-icon'),
-            pinBtn: document.getElementById('pin-btn'),
-            pinIcon: document.getElementById('pin-icon'),
             urlInput: document.getElementById('url-input'),
             urlContainer: document.getElementById('url-input-container'),
             videoPlayer: document.getElementById('video-player'),
             pasteBtn: document.getElementById('paste-btn'),
             loadBtn: document.getElementById('load-btn'),
-            titlebarInput: document.getElementById('titlebar-input'),
-            pasteQuickBtn: document.getElementById('paste-quick-btn'),
+            pinToast: document.getElementById('pin-toast'),
             iframeOverlay: document.getElementById('iframe-overlay')
         }};
         
@@ -621,6 +573,11 @@ fn main() -> wry::Result<()> {
             
             elements.videoPlayer.src = createEmbedUrl(urlData);
             
+            // Remembered so the next launch reopens this video.
+            if (window.ipc) {{
+                window.ipc.postMessage(`save:${{url}}`);
+            }}
+            
             setTimeout(() => {{
                 elements.videoPlayer.classList.remove('hidden');
                 elements.urlContainer.classList.add('hidden');
@@ -633,15 +590,8 @@ fn main() -> wry::Result<()> {
                 state.watchingVideo = true;
                 state.isPlaylist = urlData.isPlaylist;
                 
-                // Show browser button when watching
-                const browserBtn = document.getElementById('browser-btn');
-                if (browserBtn) browserBtn.style.display = 'flex';
-                
                 // Show navigation overlay
                 elements.iframeOverlay.classList.add('show');
-                
-                // Clear titlebar input
-                elements.titlebarInput.value = '';
                 
                 // Start monitoring for navigation
                 lastVideoId = state.currentVideoId;
@@ -673,54 +623,21 @@ fn main() -> wry::Result<()> {
             loadVideoFromUrl(url, elements.loadBtn, 'Loading...');
         }}
         
-        function toggleMove() {{
-            state.dragEnabled = !state.dragEnabled;
-            
-            if (state.dragEnabled) {{
-                elements.titlebar.classList.add('draggable');
-                elements.moveBtn.classList.add('active');
-                elements.moveIcon.textContent = '◉';
-                elements.moveBtn.title = 'Drag Mode: ON';
-            }} else {{
-                elements.titlebar.classList.remove('draggable');
-                elements.moveBtn.classList.remove('active');
-                elements.moveIcon.textContent = '⊹';
-                elements.moveBtn.title = 'Drag Mode: OFF';
-            }}
+        let toastTimer;
+        function showToast(text, duration = 1400) {{
+            elements.pinToast.textContent = text;
+            elements.pinToast.classList.add('show');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => {{
+                elements.pinToast.classList.remove('show');
+            }}, duration);
         }}
         
-        // Handle titlebar drag
-        let isDragging = false;
-        
-        elements.titlebar.addEventListener('mousedown', (e) => {{
-            if (state.dragEnabled && e.button === 0 && !e.target.closest('.controls')) {{
-                isDragging = true;
-                if (window.ipc) {{
-                    window.ipc.postMessage('startDrag');
-                }}
-            }}
-        }});
-        
-        elements.titlebar.addEventListener('mouseup', () => {{
-            isDragging = false;
-        }});
-        
-        elements.titlebar.addEventListener('mouseleave', () => {{
-            isDragging = false;
-        }});
-        
+        // No native control exists for always-on-top, so ⌘T drives it and the
+        // toast is the only feedback that the state changed.
         function togglePin() {{
             state.pinned = !state.pinned;
-            
-            if (state.pinned) {{
-                elements.pinBtn.classList.add('active');
-                elements.pinIcon.textContent = '•';
-                elements.pinBtn.title = 'Always on Top: ON';
-            }} else {{
-                elements.pinBtn.classList.remove('active');
-                elements.pinIcon.textContent = '○';
-                elements.pinBtn.title = 'Always on Top: OFF';
-            }}
+            showToast(state.pinned ? 'Always on top: on' : 'Always on top: off');
             
             if (window.ipc) {{
                 window.ipc.postMessage(`pin:${{state.pinned}}`);
@@ -797,57 +714,6 @@ fn main() -> wry::Result<()> {
             }}, 2000);
         }}
         
-        async function pasteQuick() {{
-            elements.pasteQuickBtn.style.opacity = '0.7';
-            elements.pasteQuickBtn.textContent = '⟳';
-            
-            try {{
-                console.log('Starting quick paste operation...');
-                
-                if (!navigator.clipboard || !navigator.clipboard.readText) {{
-                    throw new Error('Clipboard API not supported');
-                }}
-                
-                const text = await navigator.clipboard.readText();
-                console.log('Quick paste clipboard text:', text);
-                
-                if (!text || !text.trim()) {{
-                    throw new Error('Clipboard is empty');
-                }}
-                
-                const trimmedText = text.trim();
-                
-                if (!trimmedText.includes('youtube.com') && !trimmedText.includes('youtu.be')) {{
-                    throw new Error('No YouTube URL found in clipboard');
-                }}
-                
-                const urlData = parseYouTubeUrl(trimmedText);
-                console.log('Quick paste URL data:', urlData);
-                
-                if (!urlData || (!urlData.isVideo && !urlData.isPlaylist)) {{
-                    throw new Error('Invalid YouTube URL format');
-                }}
-                
-                // Load video directly without showing input container
-                console.log('Loading video from quick paste...');
-                loadVideoFromUrl(trimmedText);
-                
-                elements.pasteQuickBtn.textContent = '✓';
-                elements.pasteQuickBtn.style.color = '#10b981';
-                
-            }} catch (error) {{
-                console.error('Quick paste failed:', error.message);
-                elements.pasteQuickBtn.textContent = '✗';
-                elements.pasteQuickBtn.style.color = '#ef4444';
-            }}
-            
-            setTimeout(() => {{
-                elements.pasteQuickBtn.style.opacity = '1';
-                elements.pasteQuickBtn.textContent = '📋';
-                elements.pasteQuickBtn.style.color = '';
-            }}, 1500);
-        }}
-        
         function closeApp() {{
             if (window.ipc) {{
                 window.ipc.postMessage('close');
@@ -862,10 +728,6 @@ fn main() -> wry::Result<()> {
             elements.urlInput.focus();
             elements.urlInput.select();
             state.watchingVideo = false;
-            
-            // Hide browser button when not watching
-            const browserBtn = document.getElementById('browser-btn');
-            if (browserBtn) browserBtn.style.display = 'none';
             
             // Hide navigation overlay
             elements.iframeOverlay.classList.remove('show');
@@ -899,16 +761,6 @@ fn main() -> wry::Result<()> {
             }}
         }});
         
-        elements.titlebarInput.addEventListener('keydown', (e) => {{
-            if (e.key === 'Enter') {{
-                e.preventDefault();
-                const url = elements.titlebarInput.value.trim();
-                if (url) {{
-                    loadVideoFromUrl(url);
-                }}
-            }}
-        }});
-        
         document.addEventListener('keydown', (e) => {{
             if (e.key === 'Escape') {{
                 closeApp();
@@ -927,6 +779,23 @@ fn main() -> wry::Result<()> {
             if ((e.metaKey || e.ctrlKey) && e.key === 'n') {{
                 e.preventDefault();
                 showUrlInput();
+            }}
+            
+            // The native titlebar carries no app controls, so these keys are the
+            // only way to reach what the custom bar used to expose.
+            if ((e.metaKey || e.ctrlKey) && e.key === 'l') {{
+                e.preventDefault();
+                showUrlInput();
+            }}
+            
+            if ((e.metaKey || e.ctrlKey) && e.key === 't') {{
+                e.preventDefault();
+                togglePin();
+            }}
+            
+            if ((e.metaKey || e.ctrlKey) && e.key === 'b') {{
+                e.preventDefault();
+                openInBrowser();
             }}
         }});
         
@@ -964,11 +833,7 @@ fn main() -> wry::Result<()> {
                         // Update our state
                         state.currentVideoId = currentVideoId;
                         lastVideoId = currentVideoId;
-                        
-                        // Clear titlebar input if user navigated via YouTube
-                        if (elements.titlebarInput.value === '') {{
-                            console.log('Auto-navigation detected, updating player state');
-                        }}
+
                     }}
                 }} catch (e) {{
                     // Ignore cross-origin errors
@@ -1043,27 +908,6 @@ fn main() -> wry::Result<()> {
             }}, 2000);
         }}
         
-        // Handle titlebar visibility
-        let hideTimeout;
-        const showTitlebar = () => {{
-            elements.titlebar.classList.add('show');
-            clearTimeout(hideTimeout);
-            hideTimeout = setTimeout(() => {{
-                if (!isDragging) {{
-                    elements.titlebar.classList.remove('show');
-                }}
-            }}, 3000);
-        }};
-        
-        document.addEventListener('mousemove', (e) => {{
-            if (e.clientY < 100) {{
-                showTitlebar();
-            }}
-        }});
-        
-        // Keep titlebar visible when dragging
-        elements.titlebar.addEventListener('mouseenter', showTitlebar);
-        
         // Disable context menu
         window.addEventListener('contextmenu', e => e.preventDefault());
     </script>
@@ -1071,7 +915,7 @@ fn main() -> wry::Result<()> {
 </html>
 "#, initial_url.replace("\\", ""));
 
-    let _webview = WebViewBuilder::new(window)?
+    let webview = WebViewBuilder::new(window)?
         .with_html(html)?
         .with_ipc_handler(move |window, message| {
             match message.as_str() {
@@ -1082,10 +926,8 @@ fn main() -> wry::Result<()> {
                     let pinned = msg.split(':').nth(1).unwrap_or("true") == "true";
                     window.set_always_on_top(pinned);
                 }
-                msg if msg.starts_with("startDrag") => {
-                    if let Err(e) = window.drag_window() {
-                        eprintln!("Failed to start drag: {:?}", e);
-                    }
+                msg if msg.starts_with("save:") => {
+                    write_last_url(&msg["save:".len()..]);
                 }
                 msg if msg.starts_with("navigate:") => {
                     println!("Navigation request: {}", msg);
@@ -1099,11 +941,25 @@ fn main() -> wry::Result<()> {
         })
         .build()?;
 
+    // macOS has no auto-hiding titlebar outside fullscreen, so the buttons are
+    // faded by hand. 150ms is frequent enough to feel immediate without keeping
+    // the event loop busy.
+    const HOVER_POLL: Duration = Duration::from_millis(150);
+    let mut buttons_visible = false;
+
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + HOVER_POLL);
 
         match event {
             Event::NewEvents(StartCause::Init) => println!("YouTube Player started"),
+            Event::NewEvents(_) => {
+                let window = webview.window();
+                let hovered = cursor_is_over_window(window);
+                if hovered != buttons_visible {
+                    buttons_visible = hovered;
+                    set_titlebar_buttons_alpha(window, if hovered { 1.0 } else { 0.0 });
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..

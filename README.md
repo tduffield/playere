@@ -4,11 +4,16 @@ A lightweight, distraction-free YouTube player built with Rust and Tauri. Watch 
 
 ## Features
 
-- **Frameless Window**: Clean, borderless design
-- **Drag to Move**: Click and drag the top area to move the window
-- **Always on Top**: Window stays above other applications
+- **Auto-hiding Titlebar**: A standard macOS titlebar whose window buttons fade
+  out while the pointer is away, so the video runs edge to edge
+- **Resumes Where You Left Off**: Reopens the last video you loaded
+- **Always on Top**: Optional, off by default (`⌘T`)
 - **URL Auto-conversion**: Automatically converts YouTube URLs to embedded format
 - **Keyboard Shortcuts**: 
+  - `⌘L` to enter a different video (`⌘N` does the same)
+  - `⌘T` to toggle always on top
+  - `⌘B` to open the current video in your browser
+  - `⌘V` to paste a URL straight from the clipboard
   - `ESC` to close the player
   - `Enter` to load video from URL input
 - **Cross-platform**: Works on macOS, Linux, and Windows
@@ -93,8 +98,11 @@ cargo run --release
 2. **Load Video**: 
    - Paste a YouTube URL in the input field
    - Press Enter or click "Load Video"
-3. **Move Window**: Click and drag the top area of the window
-4. **Close**: Click the ✕ button (appears on hover) or press ESC
+3. **Move Window**: Drag the titlebar, as with any macOS window
+4. **Close**: Click the red window button (fades in on hover) or press ESC
+
+The window buttons are hidden while the pointer is outside the window. Move the
+mouse over the player to bring them back.
 
 ### Supported URL Formats
 
@@ -177,11 +185,18 @@ playere/
 You can customize the player by modifying:
 
 1. **Window Size**: Edit `width` and `height` in `tauri.conf.json`
-2. **Always on Top**: Toggle `alwaysOnTop` in `tauri.conf.json`
-3. **Styling**: Modify CSS in `dist/index.html`
+2. **Always on Top**: Press `⌘T` at runtime; change the launch default in the
+   `with_always_on_top` call in `src/main.rs`
+3. **Styling**: Modify the CSS in the inline HTML in `src/main.rs` (the
+   webview is served from there, not from `dist/`)
 4. **Embed Parameters**: Edit the URL parameters in `src/main.rs`
 5. **App Icon**: Edit the shapes in `icons/generate-icon.sh`, re-run it, then
    rebuild with `./build-release.sh`
+
+The last video you loaded is remembered in
+`~/Library/Application Support/YouTube Player/state.json` and reopened on the
+next launch. Delete that file to start from the URL entry screen. Passing a URL
+on the command line takes precedence over it.
 
 ### App Icon
 
@@ -203,10 +218,10 @@ together — dropping either one brings the plate back.
 2. Ensure the YouTube URL is valid
 3. Some videos may have embedding restrictions
 
-### Window Not Dragging
+### Window Buttons Not Visible
 
-- Make sure to click and drag only the top area of the window
-- The drag region is the top 40 pixels of the window
+- They fade out whenever the pointer leaves the window; move the mouse over the
+  player to bring them back
 
 ### App Crashes on Startup
 
